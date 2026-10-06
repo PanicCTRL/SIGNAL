@@ -1,4 +1,4 @@
-﻿"""
+"""
 chart_canvas.py — Графический холст проекта SIGNAL
 Двухпанельный график на базе PyQt6 и pyqtgraph:
 - Верхняя панель (plot_candles): свечи, регрессионные каналы, уровни.
@@ -9,7 +9,7 @@ chart_canvas.py — Графический холст проекта SIGNAL
 
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor, QPen
+from PyQt6.QtGui import QColor, QPen, QFont
 from candlestick_item import CandlestickItem
 
 # Глобальные настройки pyqtgraph: тёмная палитра и сглаживание
@@ -88,38 +88,255 @@ class ChartCanvas(pg.GraphicsLayoutWidget):
         self.macd_zero_line = pg.InfiniteLine(pos=0.0, angle=0, pen=zero_pen)
         self.plot_macd.addItem(self.macd_zero_line)
 
+        # 6. Линия текущей цены (золотистый луч в стиле QUIK / STRG)
+        pen_cur_price = pg.mkPen(color='#c9b037', width=1, style=Qt.PenStyle.SolidLine)
+        pen_cur_price.setCosmetic(True)
+        self.current_price_line = pg.InfiniteLine(pos=0, angle=0, pen=pen_cur_price)
+        self.current_price_line.setVisible(False)
+        self.plot_candles.addItem(self.current_price_line)
+
+        # Текстовая плашка цены на правом краю
+        self.price_label = pg.TextItem(
+            text="", anchor=(0.0, 0.5), color="#111111",
+            fill=pg.mkBrush("#c9b037")
+        )
+        self.price_label.setFont(QFont("Tahoma", 8, QFont.Weight.Bold))
+        self.price_label.setVisible(False)
+        self.plot_candles.addItem(self.price_label)
+
+        # 7. Хранилище графических элементов первой линии ЗигЗага
+        self.zigzag_items = []
+
+        # 8. Хранилище графических элементов канала регрессии
+        self.regression_items = []
+
+        self.full_candles_count = 0
+
+    def set_full_timeline(self, candles):
+        """
+        Установить фиксированную разметку нижней оси времени на весь день.
+        Это предотвращает скачки меток времени при пошаговом воспроизведении.
+        """
+        if not candles:
+            return
+        time_labels = []
+        all_lows = []
+        all_highs = []
+        for c in candles:
+            t_str = c.get('time', '')
+            time_labels.append(t_str[:5] if len(t_str) >= 5 else t_str)
+            all_lows.append(c['low'])
+            all_highs.append(c['high'])
+        self.time_axis.set_labels(time_labels)
+        self.full_candles_count = len(candles)
+        self.full_min_price = min(all_lows) if all_lows else 0.0
+        self.full_max_price = max(all_highs) if all_highs else 0.0
+
+    def render_frame(self, candles, current_price=None, auto_range=False):
+        """
+        Отображает текущий срез свечей с честным живым морфингом крайней свечи.
+        candles: срез словарей свечей
+        current_price: float последняя цена тика
+        """
+        if not candles:
+            self.candles_item.set_data([])
+            self.current_price_line.setVisible(False)
+            self.price_label.setVisible(False)
+            return
+
+        candle_data = [
+            (i, c['open'], c['close'], c['low'], c['high'])
+            for i, c in enumerate(candles)
+        ]
+        self.candles_item.set_data(candle_data)
+
+        # Обновление линии текущей цены
+        n = len(candles)
+        p_val = current_price if current_price is not None else candles[-1]['close']
+        self.current_price_line.setVisible(True)
+        self.price_label.setVisible(True)
+        self.current_price_line.setValue(p_val)
+        self.price_label.setText(f" {int(p_val):,} ".replace(",", " "))
+        self.price_label.setPos(n + 0.3, p_val)
+
+        if auto_range:
+            min_p = getattr(self, 'full_min_price', min(c['low'] for c in candles))
+            max_p = getattr(self, 'full_max_price', max(c['high'] for c in candles))
+            pad = (max_p - min_p) * 0.08
+            if pad == 0:
+                pad = 100
+            total_n = max(self.full_candles_count, n)
+            self.plot_candles.setXRange(-2, total_n + 3, padding=0.01)
+            self.plot_candles.setYRange(min_p - pad, max_p + pad, padding=0.01)
+
     def set_candles(self, candles):
         """
-        Загрузить и отобразить массив свечей на верхнем графике.
-        candles: список словарей [{'date': ..., 'time': ..., 'open': ..., 'high': ..., 'low': ..., 'close': ...}]
+        Загрузить и отобразить массив свечей на верхнем графике на весь день.
         """
         if not candles:
             self.clear_plots()
             return
+        self.set_full_timeline(candles)
+        self.render_frame(candles, auto_range=True)
 
-        # Формируем данные для CandlestickItem: (x, open, close, low, high)
-        candle_data = []
-        time_labels = []
+    def render_zigzag(self, pivots):
+        """
+        Отрисовать опорную линию ЗигЗага:
+        - Линия небесно-голубого цвета (#00e5ff, 2.5px)
+        - Круглые маркеры на вершине (зеленый) и впадине (красный)
+        - Плашки цен с цифрами
+        """
+        for item in self.zigzag_items:
+            self.plot_candles.removeItem(item)
+        self.zigzag_items.clear()
 
-        for i, c in enumerate(candles):
-            candle_data.append((i, c['open'], c['close'], c['low'], c['high']))
-            # Время свечи без секунд (например, '10:30')
-            t_str = c['time']
-            time_labels.append(t_str[:5] if len(t_str) >= 5 else t_str)
+        if not pivots or len(pivots) < 2:
+            return
 
-        # Передаем метки времени в нижнюю ось
-        self.time_axis.set_labels(time_labels)
+        x_coords = [float(p["bar_idx"]) for p in pivots]
+        y_coords = [float(p["price"]) for p in pivots]
 
-        # Обновляем графический элемент свечей
-        self.candles_item.set_data(candle_data)
+        pen_zigzag = pg.mkPen(color='#00e5ff', width=2.5)
+        curve = pg.PlotCurveItem(x=x_coords, y=y_coords, pen=pen_zigzag)
+        self.plot_candles.addItem(curve)
+        self.zigzag_items.append(curve)
 
-        # Автомасштабирование по осям X и Y с небольшим отступом
-        self.plot_candles.enableAutoRange()
-        self.plot_candles.setXRange(-1, len(candles) + 1, padding=0.02)
+        for p in pivots:
+            bx = float(p["bar_idx"])
+            py = float(p["price"])
+            is_high = (p["type"] == "HIGH")
+            dot_color = '#00e676' if is_high else '#ff1744'
+
+            # Круглый маркер вершины/впадины
+            sp_dot = pg.ScatterPlotItem(
+                x=[bx], y=[py], symbol='o', size=9,
+                pen=pg.mkPen(color='#111111', width=1.5),
+                brush=pg.mkBrush(dot_color)
+            )
+            self.plot_candles.addItem(sp_dot)
+            self.zigzag_items.append(sp_dot)
+
+            # Текстовая плашка цены над вершиной / под низиной
+            badge = pg.TextItem(
+                text=f" {int(py):,} ".replace(",", " "),
+                color='#ffffff',
+                fill=pg.mkBrush(dot_color if is_high else '#b71c1c'),
+                anchor=(0.5, 1.4 if is_high else -0.4)
+            )
+            badge.setFont(QFont("Tahoma", 8, QFont.Weight.Bold))
+            badge.setPos(bx, py)
+            self.plot_candles.addItem(badge)
+            self.zigzag_items.append(badge)
+
+    def render_regression_channel(self, ch):
+        """
+        Отрисовать регрессионный канал и точки на текущей свече:
+        - Центральная линия регрессии (золотистая / желтая пунктирная, 2px)
+        - Верхняя граница коридора (зеленая, 1.8px)
+        - Нижняя граница коридора (красная, 1.8px)
+        - Полупрозрачная заливка коридора
+        - Точки (верх, центр, низ) на текущей свече с плашками цен (округление до шага цены 25)
+        """
+        for item in self.regression_items:
+            self.plot_candles.removeItem(item)
+        self.regression_items.clear()
+
+        if not ch:
+            return
+
+        x = ch["x"]
+        y_mid = ch["y_mid"]
+        y_up = ch["y_upper"]
+        y_dn = ch["y_lower"]
+
+        # 1. Линии канала
+        pen_mid = pg.mkPen(color='#ffd600', width=2.0, style=Qt.PenStyle.DashLine)
+        pen_up = pg.mkPen(color='#00e676', width=1.8)
+        pen_dn = pg.mkPen(color='#ff5252', width=1.8)
+
+        curve_mid = pg.PlotCurveItem(x=x, y=y_mid, pen=pen_mid)
+        curve_up = pg.PlotCurveItem(x=x, y=y_up, pen=pen_up)
+        curve_dn = pg.PlotCurveItem(x=x, y=y_dn, pen=pen_dn)
+
+        # 2. Полупрозрачная заливка между верхней и нижней границами
+        fill_brush = pg.mkBrush(255, 214, 0, 18)
+        fill_item = pg.FillBetweenItem(curve_up, curve_dn, brush=fill_brush)
+
+        self.plot_candles.addItem(fill_item)
+        self.plot_candles.addItem(curve_up)
+        self.plot_candles.addItem(curve_dn)
+        self.plot_candles.addItem(curve_mid)
+
+        self.regression_items.extend([fill_item, curve_up, curve_dn, curve_mid])
+
+        # 3. Точки на финише волны ЗигЗага (без текстовых плашек)
+        curr_x = x[1]
+        for label, price, color_hex in [
+            ("ВЕРХ", ch["curr_upper_round"], '#00e676'),
+            ("ЦЕНТР", ch["curr_mid_round"], '#ffd600'),
+            ("НИЗ", ch["curr_lower_round"], '#ff5252'),
+        ]:
+            dot = pg.ScatterPlotItem(
+                x=[curr_x], y=[price], symbol='s' if label == "ЦЕНТР" else 'o', size=8,
+                pen=pg.mkPen(color='#111111', width=1.2),
+                brush=pg.mkBrush(color_hex)
+            )
+            self.plot_candles.addItem(dot)
+            self.regression_items.append(dot)
+
+        # 4. Продолжение линий тренда вперед, пока свечи пересекаются с коридором
+        if ch.get("has_extension"):
+            x_ext = ch["x_ext"]
+            y_ext_up = ch["y_ext_upper"]
+            y_ext_mid = ch["y_ext_mid"]
+            y_ext_dn = ch["y_ext_lower"]
+
+            pen_ext_up = pg.mkPen(color='#00e676', width=1.8, style=Qt.PenStyle.DashLine)
+            pen_ext_mid = pg.mkPen(color='#ffd600', width=1.8, style=Qt.PenStyle.DotLine)
+            pen_ext_dn = pg.mkPen(color='#ff5252', width=1.8, style=Qt.PenStyle.DashLine)
+
+            c_ext_up = pg.PlotCurveItem(x=x_ext, y=y_ext_up, pen=pen_ext_up)
+            c_ext_mid = pg.PlotCurveItem(x=x_ext, y=y_ext_mid, pen=pen_ext_mid)
+            c_ext_dn = pg.PlotCurveItem(x=x_ext, y=y_ext_dn, pen=pen_ext_dn)
+
+            fill_ext = pg.FillBetweenItem(c_ext_up, c_ext_dn, brush=pg.mkBrush(255, 214, 0, 12))
+
+            self.plot_candles.addItem(fill_ext)
+            self.plot_candles.addItem(c_ext_up)
+            self.plot_candles.addItem(c_ext_dn)
+            self.plot_candles.addItem(c_ext_mid)
+
+            self.regression_items.extend([fill_ext, c_ext_up, c_ext_dn, c_ext_mid])
+
+        # 5. Информационная плашка параметров тренда (наклон, Пирсон r, R2)
+        r_val = ch["r"]
+        slope_val = ch["slope"]
+        r2_val = ch["r2"]
+        ext_info = f" -> продлен до бара {ch['ext_bar']}" if ch.get("has_extension") else ""
+        info_text = f" r = {r_val:+.3f} | R2 = {r2_val:.1%} | наклон: {slope_val:+.1f} пт/бар{ext_info} "
+        info_badge = pg.TextItem(
+            text=info_text,
+            color='#ffd600',
+            fill=pg.mkBrush(20, 20, 25, 230),
+            border=pg.mkPen('#ffd600', width=1.0),
+            anchor=(0.0, 1.2)
+        )
+        info_badge.setFont(QFont("Tahoma", 8, QFont.Weight.Bold))
+        info_badge.setPos(x[0], y_up[0])
+        self.plot_candles.addItem(info_badge)
+        self.regression_items.append(info_badge)
 
     def clear_plots(self):
         """Очистить оба графика перед повторным расчетом или загрузкой нового дня."""
         self.candles_item.set_data([])
         self.time_axis.set_labels([])
+        self.current_price_line.setVisible(False)
+        self.price_label.setVisible(False)
+        for item in self.zigzag_items:
+            self.plot_candles.removeItem(item)
+        self.zigzag_items.clear()
+        for item in self.regression_items:
+            self.plot_candles.removeItem(item)
+        self.regression_items.clear()
         self.plot_macd.clear()
         self.plot_macd.addItem(self.macd_zero_line)  # Возвращаем нулевую линию обратно
