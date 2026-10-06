@@ -302,22 +302,27 @@ class MainWindow(QMainWindow):
         # Отрисовка свечей и бегающей линии цены
         self.canvas.render_frame(visible_candles, current_price=curr_price, auto_range=auto_range)
 
-        # Динамический пересчет ЗигЗага и Регрессии по уже видимым свечам
+        # Динамический пересчет ЗигЗага и Регрессии
         if len(visible_candles) >= 2:
             pivots = self.zigzag_calc.calculate_zigzag(visible_candles, dev_percent=0.9)
             self.canvas.render_zigzag(pivots)
 
+            # Канал линейной регрессии строится строго по закрытым свечам, исключая текущую формирующуюся (дышащую)
             last_wave = self.zigzag_calc.last_line
+            channel = None
             if last_wave and "start_bar" in last_wave and "end_bar" in last_wave and len(visible_candles) >= 3:
-                channel = self.reg_calc.calculate_channel(
-                    visible_candles,
-                    start_bar=last_wave["start_bar"],
-                    end_bar=last_wave["end_bar"],
-                    k=2.0
-                )
-                self.canvas.render_regression_channel(channel)
-            else:
-                self.canvas.render_regression_channel(None)
+                closed_candles = visible_candles[:-1] if len(visible_candles) > 1 else visible_candles
+                closed_end_bar = min(int(last_wave["end_bar"]), len(closed_candles))
+                start_bar = int(last_wave["start_bar"])
+
+                if closed_end_bar - start_bar + 1 >= 3:
+                    channel = self.reg_calc.calculate_channel(
+                        closed_candles,
+                        start_bar=start_bar,
+                        end_bar=closed_end_bar,
+                        k=2.0
+                    )
+            self.canvas.render_regression_channel(channel)
         else:
             self.canvas.render_zigzag([])
             self.canvas.render_regression_channel(None)
