@@ -11,6 +11,7 @@ import pyqtgraph as pg
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QPen, QFont
 from candlestick_item import CandlestickItem
+import theme
 
 # Глобальные настройки pyqtgraph: тёмная палитра и сглаживание
 pg.setConfigOption('background', '#111111')   # Глубокий тёмно-серый фон графика
@@ -111,6 +112,14 @@ class ChartCanvas(pg.GraphicsLayoutWidget):
         self.regression_items = []
 
         self.full_candles_count = 0
+        self.last_channel = None
+
+        # Динамическое продление регрессии до края вьюпорта при скролле и зуме
+        self.plot_candles.getViewBox().sigRangeChanged.connect(self._on_view_range_changed)
+
+    def _on_view_range_changed(self):
+        if self.last_channel and self.regression_items:
+            self.render_regression_channel(self.last_channel)
 
     def set_full_timeline(self, candles):
         """
@@ -230,100 +239,113 @@ class ChartCanvas(pg.GraphicsLayoutWidget):
 
     def render_regression_channel(self, ch):
         """
-        Отрисовать регрессионный канал и точки на текущей свече:
-        - Центральная линия регрессии (золотистая / желтая пунктирная, 2px)
-        - Верхняя граница коридора (зеленая, 1.8px)
-        - Нижняя граница коридора (красная, 1.8px)
-        - Полупрозрачная заливка коридора
-        - Точки (верх, центр, низ) на текущей свече с плашками цен (округление до шага цены 25)
+        Отрисовать канал линейной регрессии в стиле TradingView / STRG:
+        - Линии продолжаются вправо до бесконечности (до правого края холста / вьюпорта)
+        - Верхняя граница (Upper): яркая синяя (#2962ff, 1.8px)
+        - Нижняя граница (Lower): насыщенная красная (#ef5350, 1.8px)
+        - Центральная линия (Mid): пунктирная красная (#ef5350, 1.5px, DashLine)
+        - Двухцветная заливка TradingView:
+            * Верхняя половина (Mid -> Upper): синяя полупрозрачная (41, 98, 255, 45)
+            * Нижняя половина (Lower -> Mid): красная полупрозрачная (239, 83, 80, 45)
+        - Точки на финише базовой волны (круглые синяя и красная, квадратная центральная)
+        - Информационная плашка параметров тренда (наклон, r, R2)
         """
         for item in self.regression_items:
             self.plot_candles.removeItem(item)
         self.regression_items.clear()
 
+        self.last_channel = ch
         if not ch:
             return
 
-        x = ch["x"]
-        y_mid = ch["y_mid"]
-        y_up = ch["y_upper"]
-        y_dn = ch["y_lower"]
+        pi = self.plot_candles
+        vb = pi.getViewBox()
 
-        # 1. Линии канала
-        pen_mid = pg.mkPen(color='#ffd600', width=2.0, style=Qt.PenStyle.DashLine)
-        pen_up = pg.mkPen(color='#00e676', width=1.8)
-        pen_dn = pg.mkPen(color='#ff5252', width=1.8)
+        # Вычисляем правый край вьюпорта (с запасом 200 баров), чтобы линии уходили строго за край экрана
+        right_bound = vb.viewRange()[0][1] if vb else ch.get("x_inf", [0, 500])[1]
+        x_end = max(float(ch.get("x_inf", [0, 500])[1]), float(right_bound) + 200.0)
 
-        curve_mid = pg.PlotCurveItem(x=x, y=y_mid, pen=pen_mid)
-        curve_up = pg.PlotCurveItem(x=x, y=y_up, pen=pen_up)
-        curve_dn = pg.PlotCurveItem(x=x, y=y_dn, pen=pen_dn)
+        x_start = float(ch["x"][0])
+        slope = float(ch["slope"])
+        intercept = float(ch["intercept"])
+        se = float(ch["std_error"])
+        k = float(ch["k"])
 
-        # 2. Полупрозрачная заливка между верхней и нижней границами
-        fill_brush = pg.mkBrush(255, 214, 0, 18)
-        fill_item = pg.FillBetweenItem(curve_up, curve_dn, brush=fill_brush)
+        x_bars_end = x_end - x_start + 1
+        inf_mid = slope * x_bars_end + intercept
+        inf_up = inf_mid + k * se
+        inf_dn = inf_mid - k * se
 
-        self.plot_candles.addItem(fill_item)
-        self.plot_candles.addItem(curve_up)
-        self.plot_candles.addItem(curve_dn)
-        self.plot_candles.addItem(curve_mid)
+        # Округление до биржевого шага цены 25 пт
+        inf_mid_round = round(inf_mid / 25.0) * 25.0
+        inf_up_round = round(inf_up / 25.0) * 25.0
+        inf_dn_round = round(inf_dn / 25.0) * 25.0
 
-        self.regression_items.extend([fill_item, curve_up, curve_dn, curve_mid])
+        x_coords = [x_start, x_end]
+        y_mid = [float(ch["y_mid"][0]), inf_mid_round]
+        y_up = [float(ch["y_upper"][0]), inf_up_round]
+        y_dn = [float(ch["y_lower"][0]), inf_dn_round]
 
-        # 3. Точки на финише волны ЗигЗага (без текстовых плашек)
-        curr_x = x[1]
-        for label, price, color_hex in [
-            ("ВЕРХ", ch["curr_upper_round"], '#00e676'),
-            ("ЦЕНТР", ch["curr_mid_round"], '#ffd600'),
-            ("НИЗ", ch["curr_lower_round"], '#ff5252'),
+        # 1. Линии канала (в палитре STRG / TradingView)
+        pen_up = pg.mkPen(color=theme.REGRESSION_TW_BLUE, width=1.8)
+        pen_up.setCosmetic(True)
+
+        pen_dn = pg.mkPen(color=theme.REGRESSION_TW_RED, width=1.8)
+        pen_dn.setCosmetic(True)
+
+        pen_mid = pg.mkPen(color=theme.REGRESSION_TW_MID, width=1.5, style=Qt.PenStyle.DashLine)
+        pen_mid.setCosmetic(True)
+
+        curve_up = pg.PlotCurveItem(x=x_coords, y=y_up, pen=pen_up)
+        curve_mid = pg.PlotCurveItem(x=x_coords, y=y_mid, pen=pen_mid)
+        curve_dn = pg.PlotCurveItem(x=x_coords, y=y_dn, pen=pen_dn)
+
+        # 2. Двухцветная заливка TradingView:
+        # Верхняя половина (синяя) и нижняя половина (красная)
+        brush_blue = pg.mkBrush(*theme.REGRESSION_TW_BLUE_FILL)
+        fill_upper = pg.FillBetweenItem(curve_up, curve_mid, brush=brush_blue)
+        pi.addItem(fill_upper, ignoreBounds=True)
+
+        brush_red = pg.mkBrush(*theme.REGRESSION_TW_RED_FILL)
+        fill_lower = pg.FillBetweenItem(curve_mid, curve_dn, brush=brush_red)
+        pi.addItem(fill_lower, ignoreBounds=True)
+
+        pi.addItem(curve_up, ignoreBounds=True)
+        pi.addItem(curve_dn, ignoreBounds=True)
+        pi.addItem(curve_mid, ignoreBounds=True)
+
+        self.regression_items.extend([fill_upper, fill_lower, curve_up, curve_dn, curve_mid])
+
+        # 3. Маркеры на окончании базовой волны ЗигЗага (как в STRG)
+        curr_x = float(ch["x"][1])
+        for py, color_hex, symbol in [
+            (float(ch["curr_upper_round"]), theme.REGRESSION_TW_BLUE, "o"),
+            (float(ch["curr_mid_round"]), theme.REGRESSION_TW_MID, "s"),
+            (float(ch["curr_lower_round"]), theme.REGRESSION_TW_RED, "o"),
         ]:
             dot = pg.ScatterPlotItem(
-                x=[curr_x], y=[price], symbol='s' if label == "ЦЕНТР" else 'o', size=8,
-                pen=pg.mkPen(color='#111111', width=1.2),
+                x=[curr_x], y=[py], symbol=symbol, size=7,
+                pen=pg.mkPen(color="#111111", width=1.2),
                 brush=pg.mkBrush(color_hex)
             )
-            self.plot_candles.addItem(dot)
+            pi.addItem(dot, ignoreBounds=True)
             self.regression_items.append(dot)
 
-        # 4. Продолжение линий тренда вперед, пока свечи пересекаются с коридором
-        if ch.get("has_extension"):
-            x_ext = ch["x_ext"]
-            y_ext_up = ch["y_ext_upper"]
-            y_ext_mid = ch["y_ext_mid"]
-            y_ext_dn = ch["y_ext_lower"]
-
-            pen_ext_up = pg.mkPen(color='#00e676', width=1.8, style=Qt.PenStyle.DashLine)
-            pen_ext_mid = pg.mkPen(color='#ffd600', width=1.8, style=Qt.PenStyle.DotLine)
-            pen_ext_dn = pg.mkPen(color='#ff5252', width=1.8, style=Qt.PenStyle.DashLine)
-
-            c_ext_up = pg.PlotCurveItem(x=x_ext, y=y_ext_up, pen=pen_ext_up)
-            c_ext_mid = pg.PlotCurveItem(x=x_ext, y=y_ext_mid, pen=pen_ext_mid)
-            c_ext_dn = pg.PlotCurveItem(x=x_ext, y=y_ext_dn, pen=pen_ext_dn)
-
-            fill_ext = pg.FillBetweenItem(c_ext_up, c_ext_dn, brush=pg.mkBrush(255, 214, 0, 12))
-
-            self.plot_candles.addItem(fill_ext)
-            self.plot_candles.addItem(c_ext_up)
-            self.plot_candles.addItem(c_ext_dn)
-            self.plot_candles.addItem(c_ext_mid)
-
-            self.regression_items.extend([fill_ext, c_ext_up, c_ext_dn, c_ext_mid])
-
-        # 5. Информационная плашка параметров тренда (наклон, Пирсон r, R2)
-        r_val = ch["r"]
-        slope_val = ch["slope"]
-        r2_val = ch["r2"]
-        ext_info = f" -> продлен до бара {ch['ext_bar']}" if ch.get("has_extension") else ""
-        info_text = f" r = {r_val:+.3f} | R2 = {r2_val:.1%} | наклон: {slope_val:+.1f} пт/бар{ext_info} "
+        # 4. Информационная плашка параметров тренда (наклон, Пирсон r, R2)
+        r_val = float(ch["r"])
+        slope_val = float(ch["slope"])
+        r2_val = float(ch["r2"])
+        info_text = f" r = {r_val:+.3f} | R² = {r2_val:.1%} | наклон: {slope_val:+.1f} пт/бар "
         info_badge = pg.TextItem(
             text=info_text,
-            color='#ffd600',
-            fill=pg.mkBrush(20, 20, 25, 230),
-            border=pg.mkPen('#ffd600', width=1.0),
+            color="#ffffff",
+            fill=pg.mkBrush(16, 20, 32, 230),
+            border=pg.mkPen(theme.REGRESSION_TW_BLUE, width=1.0),
             anchor=(0.0, 1.2)
         )
         info_badge.setFont(QFont("Tahoma", 8, QFont.Weight.Bold))
-        info_badge.setPos(x[0], y_up[0])
-        self.plot_candles.addItem(info_badge)
+        info_badge.setPos(float(ch["x"][0]), float(ch["y_upper"][0]))
+        pi.addItem(info_badge, ignoreBounds=True)
         self.regression_items.append(info_badge)
 
     def clear_plots(self):

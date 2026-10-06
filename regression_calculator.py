@@ -29,7 +29,7 @@ class RegressionCalculator:
             return round(price)
         return round(price / self.price_step) * self.price_step
 
-    def calculate_channel(self, candles, start_bar=None, end_bar=None, k=2.0, price_key="close"):
+    def calculate_channel(self, candles, start_bar=None, end_bar=None, k=2.0, price_key="close", extend_bars=500):
         """
         Рассчитывает регрессионный канал по свечам через Lua.
         :param candles: список словарей свечей [{'close': ..., 'time': ...}]
@@ -37,6 +37,7 @@ class RegressionCalculator:
         :param end_bar: номер бара конца отрезка (1-indexed)
         :param k: множитель стандартной ошибки Se (обычно 2.0 = 2 сигмы)
         :param price_key: поле цены для регрессии ("close", "high", "low")
+        :param extend_bars: количество баров для продолжения линий вправо (до краев экрана)
         :return: словарь с параметрами тренда, точками на текущей свече и линиями для холста
         """
         if not candles or len(candles) < 3:
@@ -94,7 +95,20 @@ class RegressionCalculator:
         # Координаты для отрисовки на холсте pyqtgraph (0-indexed по X)
         x_coords = [float(start_bar - 1), float(end_bar - 1)]
 
-        # Параметры продолжения линий канала вперед
+        # 1. Бесконечное продолжение линий вправо (до краев экрана / TradingView Extend Right)
+        inf_bar = end_bar + int(extend_bars)
+        x_inf_bar = inf_bar - start_bar + 1
+        inf_mid = slope * x_inf_bar + intercept
+        inf_upper = inf_mid + float(k) * se
+        inf_lower = inf_mid - float(k) * se
+
+        inf_mid_round = self.round_to_step(inf_mid)
+        inf_upper_round = self.round_to_step(inf_upper)
+        inf_lower_round = self.round_to_step(inf_lower)
+
+        x_inf = [float(start_bar - 1), float(start_bar - 1 + inf_bar - start_bar)]
+
+        # 2. Параметры продолжения линий канала вперед по свечам
         ext_bar = int(lua_res.extBar or end_bar)
         ext_mid = float(lua_res.extMid or curr_mid)
         ext_upper = float(lua_res.extUpper or curr_upper)
@@ -111,8 +125,8 @@ class RegressionCalculator:
             "r": r,
             "slope": slope,
             "intercept": intercept,
-            "r2": r2,
             "std_error": se,
+            "r2": r2,
             "k": float(k),
             "start_bar": start_bar,
             "end_bar": end_bar,
@@ -130,6 +144,11 @@ class RegressionCalculator:
             "y_mid": [start_mid_round, curr_mid_round],
             "y_upper": [start_upper_round, curr_upper_round],
             "y_lower": [start_lower_round, curr_lower_round],
+            # Координаты бесконечного продления вправо (до краев экрана)
+            "x_inf": x_inf,
+            "y_inf_mid": [start_mid_round, inf_mid_round],
+            "y_inf_upper": [start_upper_round, inf_upper_round],
+            "y_inf_lower": [start_lower_round, inf_lower_round],
             # Координаты продолжения линий вперед
             "has_extension": has_extension,
             "ext_bar": ext_bar,
